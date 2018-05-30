@@ -17,14 +17,15 @@ import dbt.clients.agate_helper
 
 import dbt.context.parser
 
-import dbt.contracts.graph.parsed
-import dbt.contracts.graph.unparsed
 import dbt.contracts.project
+import dbt.contracts.catalog
 
 from dbt.node_types import NodeType, RunHookType
 from dbt.compat import basestring, to_string
 from dbt.logger import GLOBAL_LOGGER as logger
 from dbt.utils import get_pseudo_test_path, coalesce
+from dbt.contracts.graph.unparsed import UnparsedMacro, UnparsedNode
+from dbt.contracts.graph.parsed import ParsedMacro, ParsedNode
 
 
 def get_path(resource_type, package_name, resource_name):
@@ -73,7 +74,9 @@ def resolve_ref(flat_graph, target_model_name, target_model_package,
         None)
 
 
-def process_refs(flat_graph, current_project):
+def process_refs(manifest, current_project):
+    flat_graph = manifest.to_flat_graph()
+
     for _, node in flat_graph.get('nodes').items():
         target_model = None
         target_model_name = None
@@ -102,11 +105,10 @@ def process_refs(flat_graph, current_project):
                 continue
 
             target_model_id = target_model.get('unique_id')
+            manifest_node = manifest.nodes[node['unique_id']]
+            manifest_node['depends_on']['nodes'].append(target_model_id)
 
-            node['depends_on']['nodes'].append(target_model_id)
-            flat_graph['nodes'][node['unique_id']] = node
-
-    return flat_graph
+    return manifest
 
 
 def get_fqn(path, package_project_config, extra=[]):
@@ -124,6 +126,7 @@ def parse_macro_file(macro_file_path,
                      macro_file_contents,
                      root_path,
                      package_name,
+                     resource_type,
                      tags=None,
                      context=None):
 
@@ -132,19 +135,18 @@ def parse_macro_file(macro_file_path,
     to_return = {}
 
     if tags is None:
-        tags = set()
+        tags = []
 
     context = {}
 
-    base_node = {
-        'path': macro_file_path,
-        'original_file_path': macro_file_path,
-        'resource_type': NodeType.Macro,
-        'package_name': package_name,
-        'depends_on': {
-            'macros': [],
-        }
-    }
+    # change these to actual kwargs
+    base_node = UnparsedMacro(
+        path=macro_file_path,
+        original_file_path=macro_file_path,
+        package_name=package_name,
+        raw_sql=macro_file_contents,
+        root_path=root_path,
+    )
 
     try:
         template = dbt.clients.jinja.get_template(
@@ -157,23 +159,23 @@ def parse_macro_file(macro_file_path,
         if type(item) == jinja2.runtime.Macro:
             name = key.replace(dbt.utils.MACRO_PREFIX, '')
 
-            unique_id = get_path(NodeType.Macro,
+            unique_id = get_path(resource_type,
                                  package_name,
                                  name)
 
-            new_node = base_node.copy()
-            new_node.update({
-                'name': name,
-                'unique_id': unique_id,
-                'tags': tags,
-                'root_path': root_path,
-                'path': macro_file_path,
-                'original_file_path': macro_file_path,
-                'raw_sql': macro_file_contents,
-            })
+            merged = dbt.utils.deep_merge(
+                base_node.serialize(),
+                {
+                    'name': name,
+                    'unique_id': unique_id,
+                    'tags': tags,
+                    'resource_type': resource_type,
+                    'depends_on': {'macros': []},
+                })
 
-            new_node['generator'] = dbt.clients.jinja.macro_generator(
-                template, new_node)
+            new_node = ParsedMacro(
+                template=template,
+                **merged)
 
             to_return[unique_id] = new_node
 
@@ -181,11 +183,20 @@ def parse_macro_file(macro_file_path,
 
 
 def parse_node(node, node_path, root_project_config, package_project_config,
-               all_projects, tags=None, fqn_extra=None, fqn=None, macros=None):
-    logger.debug("Parsing {}".format(node_path))
-    node = copy.deepcopy(node)
+               all_projects, tags=None, fqn_extra=None, fqn=None, macros=None,
+               agate_table=None, archive_config=None):
+    """Parse a node, given an UnparsedNode and any other required information.
 
-    tags = coalesce(tags, set())
+    agate_table should be set if the node came from a seed file.
+    archive_config should be set if the node is an Archive node.
+    """
+    logger.debug("Parsing {}".format(node_path))
+
+    node = node.serialize()
+
+    if agate_table is not None:
+        node['agate_table'] = agate_table
+    tags = coalesce(tags, [])
     fqn_extra = coalesce(fqn_extra, [])
     macros = coalesce(macros, {})
 
@@ -215,7 +226,7 @@ def parse_node(node, node_path, root_project_config, package_project_config,
     # Set this temporarily. Not the full config yet (as config() hasn't been
     # called from jinja yet). But the Var() call below needs info about project
     # level configs b/c they might contain refs. TODO: Restructure this?
-    config_dict = node.get('config', {})
+    config_dict = coalesce(archive_config, {})
     config_dict.update(config.config)
     node['config'] = config_dict
 
@@ -252,27 +263,25 @@ def parse_node(node, node_path, root_project_config, package_project_config,
 
     del node['config_reference']
 
-    return node
+    return ParsedNode(**node)
 
 
 def parse_sql_nodes(nodes, root_project, projects, tags=None, macros=None):
     if tags is None:
-        tags = set()
+        tags = []
 
     if macros is None:
         macros = {}
 
     to_return = {}
 
-    dbt.contracts.graph.unparsed.validate_nodes(nodes)
-
-    for node in nodes:
+    for n in nodes:
+        node = dbt.contracts.graph.unparsed.UnparsedNode(**n)
         package_name = node.get('package_name')
 
         node_path = get_path(node.get('resource_type'),
                              package_name,
                              node.get('name'))
-
         node_parsed = parse_node(node,
                                  node_path,
                                  root_project,
@@ -293,8 +302,6 @@ def parse_sql_nodes(nodes, root_project, projects, tags=None, macros=None):
 
         to_return[node_path] = node_parsed
 
-    dbt.contracts.graph.parsed.validate_nodes(to_return)
-
     return to_return
 
 
@@ -303,13 +310,13 @@ def load_and_parse_sql(package_name, root_project, all_projects, root_dir,
     extension = "[!.#~]*.sql"
 
     if tags is None:
-        tags = set()
+        tags = []
 
     if macros is None:
         macros = {}
 
     if dbt.flags.STRICT_MODE:
-        dbt.contracts.project.validate_list(all_projects)
+        dbt.contracts.project.ProjectList(**all_projects)
 
     file_matches = dbt.clients.system.find_matching(
         root_dir,
@@ -373,7 +380,7 @@ def load_and_parse_run_hook_type(root_project, all_projects, hook_type,
                                  macros=None):
 
     if dbt.flags.STRICT_MODE:
-        dbt.contracts.project.validate_list(all_projects)
+        dbt.contracts.project.ProjectList(**all_projects)
 
     project_hooks = get_hooks(all_projects, hook_type)
 
@@ -396,7 +403,7 @@ def load_and_parse_run_hook_type(root_project, all_projects, hook_type,
                 'index': i
             })
 
-    tags = {hook_type}
+    tags = [hook_type]
     return parse_sql_nodes(result, root_project, all_projects, tags=tags,
                            macros=macros)
 
@@ -421,10 +428,10 @@ def load_and_parse_macros(package_name, root_project, all_projects, root_dir,
     extension = "[!.#~]*.sql"
 
     if tags is None:
-        tags = set()
+        tags = []
 
     if dbt.flags.STRICT_MODE:
-        dbt.contracts.project.validate_list(all_projects)
+        dbt.contracts.project.ProjectList(**all_projects)
 
     file_matches = dbt.clients.system.find_matching(
         root_dir,
@@ -442,87 +449,105 @@ def load_and_parse_macros(package_name, root_project, all_projects, root_dir,
                 file_match.get('relative_path'),
                 file_contents,
                 root_dir,
-                package_name))
-
-    dbt.contracts.graph.parsed.validate_macros(result)
+                package_name,
+                resource_type))
 
     return result
 
 
-def get_parsed_schema_test(test_node, test_type, model_name, config,
-                           root_project, projects, macros):
+def get_canonical_test_def(test_node, model_name, column_name, test_def, projects):
+    if isinstance(test_def, basestring):
+        test_name = test_def
+        test_args = {"arg": column_name}
+
+    elif isinstance(test_def, dict):
+        if len(test_def) != 1:
+            import ipdb; ipdb.set_trace()
+            raise RuntimeError("bad test")
+
+        test_name = list(test_def.keys())[0]
+        test_args = test_def[test_name]
+
+    else:
+        raise RuntimeError("bad")
 
     package_name = test_node.get('package_name')
     test_namespace = None
-    original_test_type = test_type
-    split = test_type.split('.')
+    split = test_name.split('.', 1)
 
     if len(split) > 1:
-        test_type = split[1]
-        package_name = split[0]
+        package_name, test_name = split
         test_namespace = package_name
 
     source_package = projects.get(package_name)
     if source_package is None:
-        desc = '"{}" test on model "{}"'.format(original_test_type, model_name)
+        desc = '"{}" test on model "{}"'.format(test_name, model_name)
         dbt.exceptions.raise_dep_not_found(test_node, desc, test_namespace)
 
-    return parse_schema_test(
-        test_node,
-        model_name,
-        config,
-        test_namespace,
-        test_type,
-        root_project,
-        source_package,
-        all_projects=projects,
-        macros=macros)
+    test_args['model'] = 'ref("{}")'.format(model_name)
+
+    return {
+        "test_name": test_name,
+        "args": test_args,
+        "namespace": test_namespace,
+        "model_name": model_name,
+    }
 
 
-def parse_schema_tests(tests, root_project, projects, macros=None):
+def get_parsed_model_columns(schema_node, model_name, model_spec,
+                           root_project, projects, macros):
+
+    package_name = schema_node.get('package_name')
+    columns = model_spec.get('columns', [])
+
+    parsed_columns = []
+    for column in columns:
+
+        canonical_tests = []
+        for provided_test_def in column['tests']:
+            column_name = column['name']
+            # test_def = get_model_column_test(schema_node, model_name, column_name, provided_test_def, projects)
+            test_def = get_canonical_test_def(schema_node, model_name, column_name, provided_test_def, projects)
+            canonical_tests.append(test_def)
+
+        column_def = {
+            "name": column['name'],
+            "comment": column['comment'],
+            "tests": canonical_tests
+        }
+        parsed_columns.append(column_def)
+
+    return parsed_columns
+
+
+def parse_schema_yml(test, root_project, projects, macros=None):
     to_return = {}
 
-    for test in tests:
-        raw_yml = test.get('raw_yml')
-        test_name = "{}:{}".format(test.get('package_name'), test.get('path'))
+    raw_yml = test.get('raw_yml')
+    test_name = "{}:{}".format(test.get('package_name'), test.get('path'))
 
-        try:
-            test_yml = dbt.clients.yaml_helper.load_yaml_text(raw_yml)
-        except dbt.exceptions.ValidationException as e:
-            test_yml = None
-            logger.info("Error reading {} - Skipping\n{}".format(test_name, e))
+    try:
+        test_yml = dbt.clients.yaml_helper.load_yaml_text(raw_yml)
+    except dbt.exceptions.ValidationException as e:
+        logger.info("Error reading {} - Skipping\n{}".format(test_name, e))
+        return {}
 
-        if test_yml is None:
-            continue
 
-        no_tests_warning = ("* WARNING: No constraints found for model"
-                            " '{}' in file {}\n")
-        for model_name, test_spec in test_yml.items():
-            if test_spec is None or test_spec.get('constraints') is None:
-                test_path = test.get('original_file_path', '<unknown>')
-                logger.warning(no_tests_warning.format(model_name, test_path))
-                continue
+    for model_name, model_spec in test_yml.items():
+        model_columns = get_parsed_model_columns(test, model_name, model_spec, root_project, projects, macros)
 
-            for test_type, configs in test_spec.get('constraints', {}).items():
-                if configs is None:
-                    continue
+        unique_id = get_path('schema', test.get('package_name'), model_name)
+        model_spec = {
+            model_name: {
+                "metadata": {
+                    "comment": model_spec.get('comment')
+                },
+                "columns": model_columns
+            }
+        }
 
-                if not isinstance(configs, (list, tuple)):
-
-                    dbt.utils.compiler_warning(
-                        model_name,
-                        "Invalid test config given in {} near {}".format(
-                            test.get('path'),
-                            configs))
-                    continue
-
-                for config in configs:
-                    to_add = get_parsed_schema_test(
-                                test, test_type, model_name, config,
-                                root_project, projects, macros)
-
-                    if to_add is not None:
-                        to_return[to_add.get('unique_id')] = to_add
+        relation_spec = dbt.contracts.catalog.RelationSpec(**model_spec)
+        to_return[unique_id] = relation_spec
 
     return to_return
 
@@ -570,59 +595,68 @@ def as_kwarg(key, value):
     return "{key}={value}".format(key=key, value=formatted_value)
 
 
-def parse_schema_test(test_base, model_name, test_config, test_namespace,
-                      test_type, root_project_config, package_project_config,
-                      all_projects, macros=None):
+def get_tests_from_schema_defs(schema_node, schema_defs, root_project, all_projects, macros):
+    to_return = {}
 
-    if isinstance(test_config, (basestring, int, float, bool)):
-        test_args = {'arg': test_config}
-    else:
-        test_args = test_config
+    for schema_def in schema_defs.values():
+        for model_name, model_def in schema_def.items():
+            for column in model_def['columns']:
+                for test in column['tests']:
 
-    # sort the dict so the keys are rendered deterministically (for tests)
-    kwargs = [as_kwarg(key, test_args[key]) for key in sorted(test_args)]
+                    test_name = test['test_name']
+                    namespace = test['namespace']
+                    args = test['args']
 
-    if test_namespace is None:
-        macro_name = "test_{}".format(test_type)
-    else:
-        macro_name = "{}.test_{}".format(test_namespace, test_type)
+                    package_project_config = all_projects.get(schema_node.get('package_name'))
 
-    raw_sql = "{{{{ {macro}(model=ref('{model}'), {kwargs}) }}}}".format(**{
-        'model': model_name,
-        'macro': macro_name,
-        'kwargs': ", ".join(kwargs)
-    })
+                    # sort the dict so the keys are rendered deterministically (for tests)
+                    kwargs = [as_kwarg(key, args[key]) for key in sorted(args)]
 
-    base_path = test_base.get('path')
-    hashed_name, full_name = get_nice_schema_test_name(test_type, model_name,
-                                                       test_args)
+                    if namespace is None:
+                        macro_name = "test_{}".format(test_name)
+                    else:
+                        macro_name = "{}.test_{}".format(namespace, test_name)
 
-    hashed_path = get_pseudo_test_path(hashed_name, base_path, 'schema_test')
-    full_path = get_pseudo_test_path(full_name, base_path, 'schema_test')
+                    raw_sql = "{{{{ {macro}({kwargs}) }}}}".format(
+                        macro=macro_name,
+                        kwargs=", ".join(kwargs)
+                    )
 
-    # supply our own fqn which overrides the hashed version from the path
-    fqn_override = get_fqn(full_path, package_project_config)
+                    base_path = schema_node.get('path')
 
-    to_return = {
-        'name': full_name,
-        'resource_type': test_base.get('resource_type'),
-        'package_name': test_base.get('package_name'),
-        'root_path': test_base.get('root_path'),
-        'path': hashed_path,
-        'original_file_path': test_base.get('original_file_path'),
-        'raw_sql': raw_sql
-    }
+                    non_model_args = {k:v for (k,v) in args.items() if k != 'model'}
+                    hashed_name, full_name = get_nice_schema_test_name(test_name, model_name, args)
 
-    return parse_node(to_return,
-                      get_test_path(test_base.get('package_name'),
-                                    full_name),
-                      root_project_config,
-                      package_project_config,
-                      all_projects,
-                      tags={'schema'},
-                      fqn_extra=None,
-                      fqn=fqn_override,
-                      macros=macros)
+                    hashed_path = get_pseudo_test_path(hashed_name, base_path, 'schema_test')
+                    full_path = get_pseudo_test_path(full_name, base_path, 'schema_test')
+
+                    # supply our own fqn which overrides the hashed version from the path
+                    fqn_override = get_fqn(full_path, package_project_config)
+
+                    unparsed = UnparsedNode(
+                        name=full_name,
+                        resource_type=schema_node.get('resource_type'),
+                        package_name=schema_node.get('package_name'),
+                        root_path=schema_node.get('root_path'),
+                        path=hashed_path,
+                        original_file_path=schema_node.get('original_file_path'),
+                        raw_sql=raw_sql
+                    )
+
+                    parsed = parse_node(unparsed,
+                                      get_test_path(schema_node.get('package_name'),
+                                                    full_name),
+                                      root_project,
+                                      package_project_config,
+                                      all_projects,
+                                      tags=['schema'],
+                                      fqn_extra=None,
+                                      fqn=fqn_override,
+                                      macros=macros)
+
+                    to_return[parsed['unique_id']] = parsed
+
+    return to_return
 
 
 def load_and_parse_yml(package_name, root_project, all_projects, root_dir,
@@ -630,15 +664,14 @@ def load_and_parse_yml(package_name, root_project, all_projects, root_dir,
     extension = "[!.#~]*.yml"
 
     if dbt.flags.STRICT_MODE:
-        dbt.contracts.project.validate_list(all_projects)
+        dbt.contracts.project.ProjectList(**all_projects)
 
     file_matches = dbt.clients.system.find_matching(
         root_dir,
         relative_dirs,
         extension)
 
-    result = []
-
+    result = {}
     for file_match in file_matches:
         file_contents = dbt.clients.system.load_file_contents(
             file_match.get('absolute_path'), strip=False)
@@ -649,7 +682,7 @@ def load_and_parse_yml(package_name, root_project, all_projects, root_dir,
         parts = dbt.utils.split_path(file_match.get('relative_path', ''))
         name, _ = os.path.splitext(parts[-1])
 
-        result.append({
+        base = {
             'name': name,
             'root_path': root_dir,
             'resource_type': NodeType.Test,
@@ -657,9 +690,16 @@ def load_and_parse_yml(package_name, root_project, all_projects, root_dir,
             'original_file_path': original_file_path,
             'package_name': package_name,
             'raw_yml': file_contents
-        })
+        }
 
-    return parse_schema_tests(result, root_project, all_projects, macros)
+        # This isn't a catalog... what is it? A Schema Def?
+        schema_def = parse_schema_yml(base, root_project, all_projects, macros)
+
+        # generate schema tests from schema def
+        schema_tests = get_tests_from_schema_defs(base, schema_def, root_project, all_projects, macros)
+        result.update(schema_tests)
+
+    return result
 
 
 def parse_archives_from_projects(root_project, all_projects, macros=None):
@@ -669,7 +709,14 @@ def parse_archives_from_projects(root_project, all_projects, macros=None):
     for name, project in all_projects.items():
         archives = archives + parse_archives_from_project(project)
 
-    for archive in archives:
+    # We're going to have a similar issue with parsed nodes, if we want to
+    # make parse_node return those.
+    for a in archives:
+        # archives have a config, but that would make for an invalid
+        # UnparsedNode, so remove it and pass it along to parse_node as an
+        # argument.
+        archive_config = a.pop('config')
+        archive = UnparsedNode(**a)
         node_path = get_path(archive.get('resource_type'),
                              archive.get('package_name'),
                              archive.get('name'))
@@ -680,7 +727,8 @@ def parse_archives_from_projects(root_project, all_projects, macros=None):
             root_project,
             all_projects.get(archive.get('package_name')),
             all_projects,
-            macros=macros)
+            macros=macros,
+            archive_config=archive_config)
 
     return to_return
 
@@ -716,51 +764,52 @@ def parse_archives_from_project(project):
 
 
 def parse_seed_file(file_match, root_dir, package_name):
+    """Parse the given seed file, returning an UnparsedNode and the agate
+    table.
+    """
     abspath = file_match['absolute_path']
     logger.debug("Parsing {}".format(abspath))
     to_return = {}
     table_name = os.path.basename(abspath)[:-4]
-    node = {
-        'unique_id': get_path(NodeType.Seed, package_name, table_name),
-        'path': file_match['relative_path'],
-        'name': table_name,
-        'root_path': root_dir,
-        'resource_type': NodeType.Seed,
+    node = UnparsedNode(
+        path=file_match['relative_path'],
+        name=table_name,
+        root_path=root_dir,
+        resource_type=NodeType.Seed,
         # Give this raw_sql so it conforms to the node spec,
         # use dummy text so it doesn't look like an empty node
-        'raw_sql': '-- csv --',
-        'package_name': package_name,
-        'depends_on': {'nodes': []},
-        'original_file_path': os.path.join(file_match.get('searched_path'),
-                                           file_match.get('relative_path')),
-    }
+        raw_sql='-- csv --',
+        package_name=package_name,
+        original_file_path=os.path.join(file_match.get('searched_path'),
+                                        file_match.get('relative_path')),
+    )
     try:
         table = dbt.clients.agate_helper.from_csv(abspath)
     except ValueError as e:
         dbt.exceptions.raise_compiler_error(str(e), node)
     table.original_abspath = abspath
-    node['agate_table'] = table
-    return node
+    return node, table
 
 
 def load_and_parse_seeds(package_name, root_project, all_projects, root_dir,
                          relative_dirs, resource_type, tags=None, macros=None):
     extension = "[!.#~]*.csv"
     if dbt.flags.STRICT_MODE:
-        dbt.contracts.project.validate_list(all_projects)
+        dbt.contracts.project.ProjectList(**all_projects)
     file_matches = dbt.clients.system.find_matching(
         root_dir,
         relative_dirs,
         extension)
     result = {}
     for file_match in file_matches:
-        node = parse_seed_file(file_match, root_dir, package_name)
-        node_path = node['unique_id']
+        node, agate_table = parse_seed_file(file_match, root_dir,
+                                            package_name)
+        node_path = get_path(NodeType.Seed, package_name, node.name)
         parsed = parse_node(node, node_path, root_project,
                             all_projects.get(package_name),
-                            all_projects, tags=tags, macros=macros)
+                            all_projects, tags=tags, macros=macros,
+                            agate_table=agate_table)
         # parsed['empty'] = False
         result[node_path] = parsed
 
-    dbt.contracts.graph.parsed.validate_nodes(result)
     return result

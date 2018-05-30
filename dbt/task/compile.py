@@ -8,6 +8,9 @@ import dbt.ui.printer
 
 from dbt.task.base_task import RunnableTask
 
+import os, json
+from dbt.clients.system import write_file
+
 
 class CompileTask(RunnableTask):
     def run(self):
@@ -19,10 +22,14 @@ class CompileTask(RunnableTask):
             "include": self.args.models,
             "exclude": self.args.exclude,
             "resource_types": NodeType.executable(),
-            "tags": set()
+            "tags": []
         }
 
         results = runner.run(query, CompileRunner)
+        compiled = dict([(r.node['unique_id'], r.node['injected_sql']) for r in results])
+
+        compiled_path = os.path.join(self.project['target-path'], 'compiled.json')
+        write_file(compiled_path, json.dumps(compiled))
 
         dbt.ui.printer.print_timestamped_line('Done.')
 

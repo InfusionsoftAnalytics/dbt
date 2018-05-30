@@ -12,7 +12,7 @@ import dbt.clients.agate_helper
 
 from dbt.adapters.postgres import PostgresAdapter
 from dbt.adapters.bigquery.relation import BigQueryRelation
-from dbt.contracts.connection import validate_connection
+from dbt.contracts.connection import Connection
 from dbt.logger import GLOBAL_LOGGER as logger
 
 import google.auth
@@ -22,6 +22,7 @@ import google.cloud.bigquery
 
 import time
 import agate
+from io import StringIO
 
 
 class BigQueryAdapter(PostgresAdapter):
@@ -37,6 +38,7 @@ class BigQueryAdapter(PostgresAdapter):
         "already_exists",
         "expand_target_column_types",
         "load_dataframe",
+        "load_dataframe_direct",
 
         # versions of adapter functions that take / return Relations
         "list_relations",
@@ -44,7 +46,8 @@ class BigQueryAdapter(PostgresAdapter):
         "drop_relation",
         "rename_relation",
 
-        "get_columns_in_table"
+        "get_columns_in_table",
+        "get_catalog",
     ]
 
     Relation = BigQueryRelation
@@ -168,7 +171,7 @@ class BigQueryAdapter(PostgresAdapter):
     @classmethod
     def close(cls, connection):
         if dbt.flags.STRICT_MODE:
-            validate_connection(connection)
+            Connection(**connection)
 
         connection['state'] = 'closed'
 
@@ -314,7 +317,7 @@ class BigQueryAdapter(PostgresAdapter):
 
         if flags.STRICT_MODE:
             connection = cls.get_connection(profile, model.get('name'))
-            validate_connection(connection)
+            Connection(**connection)
 
         model_name = model.get('name')
         model_schema = model.get('schema')
@@ -350,25 +353,24 @@ class BigQueryAdapter(PostgresAdapter):
         with cls.exception_handler(profile, 'create dataset', model_name):
             iterator = query_job.result()
 
+        res = []
         if fetch:
-            res = cls.get_table_from_response(iterator)
-        else:
-            res = dbt.clients.agate_helper.empty_table()
+            res = list(iterator)
 
         # If we get here, the query succeeded
         status = 'OK'
-        return status, res
+        return status, cls.get_table_from_response(res)
 
     @classmethod
     def execute_and_fetch(cls, profile, sql, model_name, auto_begin=None):
-        status, table = cls.execute(profile, sql, model_name, fetch=True)
+        status, res = cls.execute(profile, sql, model_name, fetch=True)
+        table = cls.get_table_from_response(res)
         return status, table
 
     @classmethod
     def get_table_from_response(cls, resp):
-        column_names = [field.name for field in resp.schema]
         rows = [dict(row.items()) for row in resp]
-        return dbt.clients.agate_helper.table_from_data(rows, column_names)
+        return dbt.clients.agate_helper.table_from_data(rows)
 
     @classmethod
     def add_begin_query(cls, profile, name):
@@ -551,7 +553,58 @@ class BigQueryAdapter(PostgresAdapter):
             cls.poll_until_job_completes(job, cls.get_timeout(conn))
 
     @classmethod
+    def load_dataframe_direct(cls, profile, project_cfg, schema,
+                       table_name, agate_table,
+                       column_override, model_name=None):
+        bq_schema = cls._agate_to_schema(agate_table, column_override)
+        dataset = cls.get_dataset(profile, project_cfg, schema, None)
+        table = dataset.table(table_name)
+        conn = cls.get_connection(profile, None)
+        client = conn.get('handle')
+
+        load_config = google.cloud.bigquery.LoadJobConfig()
+        load_config.skip_leading_rows = 1
+        load_config.schema = bq_schema
+
+        tmp = StringIO()
+        agate_table.to_csv(tmp)
+
+        job = client.load_table_from_file(tmp, table, rewind=True,
+                                          job_config=load_config)
+
+        with cls.exception_handler(profile, "LOAD TABLE"):
+            cls.poll_until_job_completes(job, cls.get_timeout(conn))
+
+    @classmethod
     def expand_target_column_types(cls, profile, project_cfg, temp_table,
                                    to_schema, to_table, model_name=None):
         # This is a no-op on BigQuery
         pass
+
+    @classmethod
+    def get_catalog(cls, profile, project_cfg, manifest):
+        # schemas = cls.get_existing_schemas(profile, project_cfg)
+        schemas = list({node.to_dict()['schema'] for node in manifest.nodes.values()})
+
+        columns = []
+
+        for j, schema_name in enumerate(schemas):
+            print("schema {} of {}".format(j, len(schemas)))
+            relations = cls.list_relations(profile, project_cfg, schema_name)
+            for i, relation in enumerate(relations):
+                print("rel {} of {}".format(i, len(relations)))
+                cols = cls.get_columns_in_table(profile, project_cfg, schema_name, relation.name)
+                for col_index, col in enumerate(cols):
+                    columns.append({
+                        "table_schema": relation.schema,
+                        "table_name": relation.name,
+                        "table_type": relation.type,
+                        "table_comment": None,
+                        "column_name": col.name,
+                        "column_index": col_index,
+                        "column_type": col.data_type,
+                        "column_comment": None
+                    })
+
+
+        return dbt.clients.agate_helper.table_from_data(columns)
