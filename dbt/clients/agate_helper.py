@@ -1,12 +1,14 @@
 
 import agate
 
+agate_null_values = ['', 'na', 'n/a', 'null']
+
 DEFAULT_TYPE_TESTER = agate.TypeTester(types=[
-    agate.data_types.Number(),
-    agate.data_types.Date(),
-    agate.data_types.DateTime(),
-    agate.data_types.Boolean(),
-    agate.data_types.Text()
+    agate.data_types.Number(null_values=agate_null_values),
+    agate.data_types.Date(null_values=agate_null_values),
+    agate.data_types.DateTime(null_values=agate_null_values),
+    agate.data_types.Boolean(null_values=agate_null_values),
+    agate.data_types.Text(cast_nulls=False),
 ])
 
 
